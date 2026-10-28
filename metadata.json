@@ -1,0 +1,6 @@
+{
+  "name": "SPYCT - Gacha RPG & Mini-Games",
+  "description": "Aplicación web móvil para el juego Gacha RPG SPYCT con invocaciones, tienda de personajes, mini-juegos interactivos, inventario y conexión con Telegram Bot.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
