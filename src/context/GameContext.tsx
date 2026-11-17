@@ -260,6 +260,8 @@ const extractUsersFromUpdates = (updates: any[]): Record<string, string> => {
     recordUser(upd.chat_member?.from);
     recordUser(upd.chat_member?.new_chat_member?.user);
     recordUser(upd.my_chat_member?.from);
+    recordUser(upd.message?.left_chat_member);
+    recordUser(upd.message_reaction?.user);
     if (Array.isArray(upd.message?.new_chat_members)) {
       upd.message.new_chat_members.forEach(recordUser);
     }
@@ -900,7 +902,12 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const adminUpdateUser = (userId: string, data: Partial<User>) => {
     setUsers(prev => prev.map(u => {
       if (u.id === userId) {
-        return { ...u, ...data };
+        const telegramChanged = data.telegram !== undefined && data.telegram !== u.telegram;
+        return {
+          ...u,
+          ...data,
+          ...(telegramChanged && data.telegramChatId === undefined ? { telegramChatId: undefined } : {})
+        };
       }
       return u;
     }));
@@ -1036,13 +1043,37 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setTargetTelegramChatId(activeChatId);
         setTargetTelegramChatTitle(chatTitle);
 
+        // Verify bot's admin rights & can_manage_tags permission in the group
+        let tagPermissionNote = '';
+        if (meData.result?.id) {
+          try {
+            const memberData = await telegramApiPost(token, 'getChatMember', {
+              chat_id: activeChatId,
+              user_id: String(meData.result.id)
+            });
+            if (memberData.ok && memberData.result) {
+              const st = memberData.result.status;
+              const canManageTags = Boolean(memberData.result.can_manage_tags);
+              if (st !== 'administrator' && st !== 'creator') {
+                tagPermissionNote = ' AVISO: El bot aún no es administrador en el grupo; hazlo admin con "Gestionar etiquetas" para que asigne roles.';
+              } else if (!canManageTags) {
+                tagPermissionNote = ' AVISO: El bot es admin, pero NO tiene activado el permiso "Gestionar etiquetas" (can_manage_tags) en el grupo.';
+              } else {
+                tagPermissionNote = ' Permiso "Gestionar etiquetas" activo y listo.';
+              }
+            }
+          } catch {
+            // ignore optional diagnostic check
+          }
+        }
+
         return {
           success: true,
           botName,
           resolvedToken: token,
           resolvedChatId: activeChatId,
           chatTitle,
-          message: `¡Conexión exitosa y guardada! Mensaje enviado a "${chatTitle}" (ID: ${activeChatId}) usando ${botName}.`
+          message: `¡Conexión exitosa y guardada! Mensaje enviado a "${chatTitle}" (ID: ${activeChatId}) usando ${botName}.${tagPermissionNote}`
         };
       }
 
@@ -1191,9 +1222,21 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       const updates = Array.isArray(data.result) ? data.result : [];
-      const updatedMap = extractUsersFromUpdates(updates);
+      let updatedMap = extractUsersFromUpdates(updates);
       if (updatedMap[cleanUser] && /^\d{5,}$/.test(updatedMap[cleanUser])) {
         return { userId: updatedMap[cleanUser] };
+      }
+
+      // If backlog reached 100 updates, fetch the most recent 100 updates from the tail
+      if (updates.length >= 100) {
+        const tailRes = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=-100&limit=100`);
+        const tailData = await tailRes.json();
+        if (tailData.ok && Array.isArray(tailData.result)) {
+          updatedMap = extractUsersFromUpdates(tailData.result);
+          if (updatedMap[cleanUser] && /^\d{5,}$/.test(updatedMap[cleanUser])) {
+            return { userId: updatedMap[cleanUser] };
+          }
+        }
       }
     } catch {
       // ignore network error in lookup
@@ -1270,7 +1313,6 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // Look up fresh character data from database/state
     const dbCharacter = getCharacterById(character.id) || character;
     const agentTag = currentUser?.telegram || '@agente';
-    const agentName = currentUser?.name || 'Operativo';
     const memberTag = buildTelegramMemberTag(dbCharacter.name, dbCharacter.fandom);
 
     // Resolve user's numeric Telegram user_id if available
@@ -1280,8 +1322,8 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       connectTelegramChatId(resolvedUserId);
     }
 
-    // 1. Clean card caption: photo, Personaje, Fandom, Categoría, and web user
-    const cardCaption = `<b>${escapeTelegramHtml(dbCharacter.name)}</b>\n<b>Fandom:</b> ${escapeTelegramHtml(dbCharacter.fandom)}\n<b>Categoría:</b> ${escapeTelegramHtml(dbCharacter.category)}\n<b>Usuario:</b> ${escapeTelegramHtml(agentTag)} (${escapeTelegramHtml(agentName)})`;
+    // 1. Clean card caption: photo, Personaje, Fandom, Categoría, and web @user ONLY (no personal name)
+    const cardCaption = `<b>${escapeTelegramHtml(dbCharacter.name)}</b>\n<b>Fandom:</b> ${escapeTelegramHtml(dbCharacter.fandom)}\n<b>Categoría:</b> ${escapeTelegramHtml(dbCharacter.category)}\n<b>Usuario:</b> ${escapeTelegramHtml(agentTag)}`;
 
     const attemptSendCard = async (chatIdToUse: string) => {
       let sentOk = false;
@@ -1369,10 +1411,11 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
             tagApplied = true;
           } else {
             const desc = String(tagRes.description || 'No se pudo asignar la etiqueta');
-            if (desc.toLowerCase().includes('right') || desc.toLowerCase().includes('permission') || desc.toLowerCase().includes('manage_tags')) {
+            const descLower = desc.toLowerCase();
+            if (descLower.includes('right') || descLower.includes('permission') || descLower.includes('manage_tags')) {
               tagError = 'El bot necesita el permiso de admin "Gestionar etiquetas" (can_manage_tags) activado en el grupo.';
-            } else if (desc.toLowerCase().includes('admin') || desc.toLowerCase().includes('creator') || desc.toLowerCase().includes('owner')) {
-              tagError = 'Telegram solo permite asignar etiqueta de miembro a usuarios que NO sean administradores o dueño del grupo.';
+            } else if (descLower.includes('admin') || descLower.includes('creator') || descLower.includes('owner') || descLower.includes('member_tag')) {
+              tagError = 'Telegram no permite poner etiqueta de miembro a administradores o al dueño del grupo (solo a miembros normales). Para probarlo como usuario real, usa una cuenta que sea miembro normal del grupo.';
             } else {
               tagError = `Telegram no pudo colocar la etiqueta: ${desc}`;
             }
@@ -1421,18 +1464,14 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setTargetTelegramChatTitle(returnedTitle);
       }
 
-      // Step 4: Send final message telling the user they can now go to the roleplay scenario
+      // Step 4: Send final message telling the user they can now go to the roleplay scenario (only @user, no personal name)
       const mentionHtml = resolvedUserId
         ? `<a href="tg://user?id=${escapeTelegramHtml(resolvedUserId)}">${escapeTelegramHtml(agentTag)}</a>`
         : escapeTelegramHtml(agentTag);
 
       const roleplayReadyMessage =
         `<b>¡Ya puedes ir al escenario de rol!</b>\n\n` +
-        `${mentionHtml} (<b>${escapeTelegramHtml(agentName)}</b>), ya puedes rolear con tu ficha:\n` +
-        `• <b>Personaje:</b> ${escapeTelegramHtml(dbCharacter.name)}\n` +
-        `• <b>Fandom:</b> ${escapeTelegramHtml(dbCharacter.fandom)}\n` +
-        `• <b>Categoría:</b> ${escapeTelegramHtml(dbCharacter.category)}\n` +
-        `• <b>Etiqueta asignada:</b> <code>${escapeTelegramHtml(memberTag)}</code>`;
+        `${mentionHtml}, ya puedes rolear con <b>${escapeTelegramHtml(dbCharacter.name)}</b> (${escapeTelegramHtml(dbCharacter.fandom)} • ${escapeTelegramHtml(dbCharacter.category)}).`;
 
       await telegramApiPost(cleanToken, 'sendMessage', {
         chat_id: activeChatId,

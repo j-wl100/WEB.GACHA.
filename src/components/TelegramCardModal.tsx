@@ -59,7 +59,7 @@ export const TelegramCardModal: React.FC<Props> = ({
   const cardTelegramText = `${character.name}
 Fandom: ${character.fandom}
 Categoría: ${character.category}
-Usuario: ${currentUser?.telegram || '@agente'} (${currentUser?.name || 'Operativo'})
+Usuario: ${currentUser?.telegram || '@agente'}
 Etiqueta: ${telegramTagValue}
 
 ¡Ya puedes ir al escenario de rol!`;
