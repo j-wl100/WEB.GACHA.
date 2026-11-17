@@ -181,10 +181,12 @@ Validado por SPYCT Bot Network`;
                 Grupo de Destino:
               </span>
               <p className="text-[11px] font-bold text-[#0F172A] truncate">
-                {targetTelegramChatTitle 
-                  ? targetTelegramChatTitle 
-                  : targetTelegramChatId 
-                  ? `ID: ${targetTelegramChatId}` 
+                {targetTelegramChatTitle && targetTelegramChatId && targetTelegramChatTitle !== targetTelegramChatId
+                  ? `${targetTelegramChatTitle} (${targetTelegramChatId})`
+                  : targetTelegramChatTitle
+                  ? targetTelegramChatTitle
+                  : targetTelegramChatId
+                  ? `ID: ${targetTelegramChatId}`
                   : 'Vinculación gestionada en Panel Admin'}
               </p>
             </div>

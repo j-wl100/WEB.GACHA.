@@ -70,7 +70,7 @@ interface GameContextType {
   setTargetTelegramChatId: (chatId: string) => void;
   targetTelegramChatTitle: string;
   setTargetTelegramChatTitle: (title: string) => void;
-  testTelegramConnection: (customToken?: string, customChatId?: string) => Promise<{ success: boolean; message: string; botName?: string }>;
+  testTelegramConnection: (customToken?: string, customChatId?: string) => Promise<{ success: boolean; message: string; botName?: string; resolvedToken?: string; resolvedChatId?: string; chatTitle?: string }>;
   detectTelegramChatId: (customToken?: string) => Promise<{ success: boolean; chatId?: string; chatTitle?: string; message: string }>;
   sendCharacterToTelegram: (character: Character, level: number) => Promise<{ success: boolean; message: string }>;
   
@@ -112,6 +112,70 @@ const sanitizeCategory = (rawCat: string): Exclude<CharacterCategory, 'Todas'> =
     return rawCat as Exclude<CharacterCategory, 'Todas'>;
   }
   return 'Otro';
+};
+
+// Sanitize Telegram BotFather Token (handles pasted URLs, "bot" prefix, quotes, hidden spaces)
+export const sanitizeTelegramToken = (raw: string): string => {
+  if (!raw) return '';
+  let clean = raw.replace(/[\s"'`\u200B-\u200D\uFEFF\u00A0]+/g, '');
+  const urlMatch = clean.match(/api\.telegram\.org\/bot([^/?#]+)/i);
+  if (urlMatch && urlMatch[1]) {
+    clean = urlMatch[1];
+  }
+  const botPrefixMatch = clean.match(/^bot(\d+:.+)$/i);
+  if (botPrefixMatch && botPrefixMatch[1]) {
+    clean = botPrefixMatch[1];
+  }
+  return clean;
+};
+
+// Sanitize Telegram Chat ID (handles unicode minus, t.me links, quotes, zero-width chars, spaces)
+export const sanitizeTelegramChatId = (raw: string): string => {
+  if (!raw) return '';
+  let clean = raw
+    .replace(/["'`\u200B-\u200D\uFEFF\u00A0]+/g, '')
+    .replace(/[\u2212\u2012\u2013\u2014\u2015\uFE63\uFF0D]/g, '-')
+    .trim();
+
+  // Handle https://t.me/c/2345678901/123 -> -1002345678901
+  const privateLinkMatch = clean.match(/(?:https?:\/\/)?(?:www\.)?t\.me\/c\/(\d+)(?:\/\d+)?/i);
+  if (privateLinkMatch && privateLinkMatch[1]) {
+    return `-100${privateLinkMatch[1]}`;
+  }
+
+  // Handle https://web.telegram.org/...#-1002345678901
+  const webLinkMatch = clean.match(/web\.telegram\.org\/[^#]*#(-?\d+|@[a-zA-Z0-9_]+)/i);
+  if (webLinkMatch && webLinkMatch[1]) {
+    return webLinkMatch[1];
+  }
+
+  // Handle https://t.me/group_username -> @group_username
+  const publicLinkMatch = clean.match(/(?:https?:\/\/)?(?:www\.)?t\.me\/([a-zA-Z0-9_]{3,})(?:\/\d+)?$/i);
+  if (publicLinkMatch && publicLinkMatch[1] && publicLinkMatch[1].toLowerCase() !== 'c') {
+    return `@${publicLinkMatch[1]}`;
+  }
+
+  // Remove internal whitespace in numeric IDs (e.g. "-100 234 567")
+  if (/^[\s\d-]+$/.test(clean)) {
+    clean = clean.replace(/\s+/g, '');
+  }
+
+  return clean;
+};
+
+const escapeTelegramHtml = (text: string): string => {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+};
+
+const telegramApiPost = async (token: string, method: string, params: Record<string, string>) => {
+  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: 'POST',
+    body: new URLSearchParams(params)
+  });
+  return res.json();
 };
 
 const GameContext = createContext<GameContextType | undefined>(undefined);
@@ -195,14 +259,14 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // BotFather Token state
   const [botFatherToken, setBotFatherTokenState] = useState<string>(() => {
     try {
-      return localStorage.getItem(STORAGE_BOTFATHER_TOKEN_KEY) || '';
+      return sanitizeTelegramToken(localStorage.getItem(STORAGE_BOTFATHER_TOKEN_KEY) || '');
     } catch {
       return '';
     }
   });
 
   const setBotFatherToken = (token: string) => {
-    const clean = token.trim();
+    const clean = sanitizeTelegramToken(token);
     setBotFatherTokenState(clean);
     try {
       if (clean) {
@@ -218,7 +282,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // Target Telegram Group / Chat ID State
   const [targetTelegramChatId, setTargetTelegramChatIdState] = useState<string>(() => {
     try {
-      return localStorage.getItem(STORAGE_TELEGRAM_GROUP_ID_KEY) || '';
+      return sanitizeTelegramChatId(localStorage.getItem(STORAGE_TELEGRAM_GROUP_ID_KEY) || '');
     } catch {
       return '';
     }
@@ -233,7 +297,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   });
 
   const setTargetTelegramChatId = (chatId: string) => {
-    const clean = chatId.trim();
+    const clean = sanitizeTelegramChatId(chatId);
     setTargetTelegramChatIdState(clean);
     try {
       if (clean) {
@@ -776,9 +840,64 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setUsers(prev => [newUser, ...prev]);
   };
 
-  const testTelegramConnection = async (customToken?: string, customChatId?: string): Promise<{ success: boolean; message: string; botName?: string }> => {
-    const token = (customToken ?? botFatherToken).trim();
-    const chatId = (customChatId ?? targetTelegramChatId).trim();
+  const resolveValidTelegramChat = async (
+    token: string,
+    rawChatId: string
+  ): Promise<{ ok: boolean; chatId: string; title?: string; description?: string }> => {
+    const cleanId = sanitizeTelegramChatId(rawChatId);
+    if (!cleanId) {
+      return { ok: false, chatId: '', description: 'Chat ID vacío' };
+    }
+
+    const tryGetChat = async (idToTry: string) => {
+      return telegramApiPost(token, 'getChat', { chat_id: idToTry });
+    };
+
+    const firstData = await tryGetChat(cleanId);
+    if (firstData.ok && firstData.result) {
+      const resolvedId = String(firstData.result.id ?? cleanId);
+      const title = firstData.result.title || firstData.result.username || (firstData.result.first_name ? `${firstData.result.first_name}` : resolvedId);
+      return { ok: true, chatId: resolvedId, title };
+    }
+
+    // Handle automatic supergroup migration returned by Telegram
+    if (firstData.parameters?.migrate_to_chat_id) {
+      const migratedId = String(firstData.parameters.migrate_to_chat_id);
+      const migratedData = await tryGetChat(migratedId);
+      if (migratedData.ok && migratedData.result) {
+        const title = migratedData.result.title || migratedData.result.username || migratedId;
+        return { ok: true, chatId: migratedId, title };
+      }
+    }
+
+    // If user entered a positive number (missing "-" or "-100" prefix for a group/supergroup), try recovering
+    if (/^\d{6,}$/.test(cleanId)) {
+      const candidates = cleanId.startsWith('100')
+        ? [`-${cleanId}`, `-100${cleanId}`]
+        : [`-100${cleanId}`, `-${cleanId}`];
+
+      for (const candidate of candidates) {
+        const candData = await tryGetChat(candidate);
+        if (candData.ok && candData.result) {
+          const title = candData.result.title || candData.result.username || candidate;
+          return { ok: true, chatId: String(candData.result.id ?? candidate), title };
+        }
+      }
+    }
+
+    return {
+      ok: false,
+      chatId: cleanId,
+      description: firstData.description || 'Bad Request: chat not found'
+    };
+  };
+
+  const testTelegramConnection = async (
+    customToken?: string,
+    customChatId?: string
+  ): Promise<{ success: boolean; message: string; botName?: string; resolvedToken?: string; resolvedChatId?: string; chatTitle?: string }> => {
+    const token = sanitizeTelegramToken(customToken ?? botFatherToken);
+    const chatId = sanitizeTelegramChatId(customChatId ?? targetTelegramChatId);
 
     if (!token) {
       return { success: false, message: 'Por favor ingresa el Token de BotFather.' };
@@ -797,40 +916,50 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       const botName = `@${meData.result.username || meData.result.first_name}`;
 
-      // 2. If chatId provided, test sending a test ping to the group/chat
+      // 2. If chatId provided, resolve & test sending a ping to the group/chat
       if (chatId) {
-        const testText = `<b>Prueba de Conexión SPYCT RPG</b>\n\nEl bot <b>${botName}</b> está correctamente vinculado al sistema.\n<b>Chat Destino:</b> <code>${chatId}</code>\n<i>Listo para recibir tarjetas de personajes al pulsar "Usar".</i>`;
-        const sendRes = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: testText,
-            parse_mode: 'HTML'
-          })
+        const resolved = await resolveValidTelegramChat(token, chatId);
+        const activeChatId = resolved.ok ? resolved.chatId : chatId;
+
+        const testText = `<b>Prueba de Conexión SPYCT RPG</b>\n\nEl bot <b>${escapeTelegramHtml(botName)}</b> está correctamente vinculado al sistema.\n<b>Chat Destino:</b> <code>${escapeTelegramHtml(activeChatId)}</code>\n<i>Listo para recibir tarjetas de personajes al pulsar "Usar".</i>`;
+
+        const sendData = await telegramApiPost(token, 'sendMessage', {
+          chat_id: activeChatId,
+          text: testText,
+          parse_mode: 'HTML'
         });
-        const sendData = await sendRes.json();
+
         if (!sendData.ok) {
           return {
             success: false,
             botName,
-            message: `Bot validado (${botName}), pero no pudo enviar al grupo: ${sendData.description || 'Chat no encontrado'}. Asegúrate de que el bot sea miembro (o admin) del grupo y que el Chat ID sea correcto.`
+            resolvedToken: token,
+            resolvedChatId: activeChatId,
+            message: `Bot validado (${botName}), pero no pudo enviar al Chat ID "${activeChatId}": ${sendData.description || 'Chat no encontrado'}. Verifica que hayas guardado el ID correcto del grupo.`
           };
         }
 
-        const chatTitle = sendData.result?.chat?.title || sendData.result?.chat?.username || chatId;
+        const chatTitle = sendData.result?.chat?.title || sendData.result?.chat?.username || resolved.title || activeChatId;
+        // Persist verified token, chatId and title immediately so Enviar never uses stale/unsaved IDs
+        setBotFatherToken(token);
+        setTargetTelegramChatId(activeChatId);
         setTargetTelegramChatTitle(chatTitle);
 
         return {
           success: true,
           botName,
-          message: `¡Conexión exitosa! Mensaje de prueba enviado al grupo "${chatTitle}" usando ${botName}.`
+          resolvedToken: token,
+          resolvedChatId: activeChatId,
+          chatTitle,
+          message: `¡Conexión exitosa y guardada! Mensaje enviado a "${chatTitle}" (ID: ${activeChatId}) usando ${botName}.`
         };
       }
 
+      setBotFatherToken(token);
       return {
         success: true,
         botName,
+        resolvedToken: token,
         message: `Token válido. Bot detectado: ${botName}. Ahora ingresa el Chat ID del Grupo para completar la configuración.`
       };
     } catch (err: any) {
@@ -842,7 +971,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const detectTelegramChatId = async (customToken?: string): Promise<{ success: boolean; chatId?: string; chatTitle?: string; message: string }> => {
-    const token = (customToken ?? botFatherToken).trim();
+    const token = sanitizeTelegramToken(customToken ?? botFatherToken);
     if (!token) {
       return { success: false, message: 'Primero ingresa y guarda tu Token de BotFather.' };
     }
@@ -868,41 +997,64 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         };
       }
 
-      // Prioritize groups or supergroups
-      let groupChat: { id: string | number; title?: string; type?: string; username?: string } | null = null;
-      let fallbackChat: { id: string | number; title?: string; type?: string; username?: string } | null = null;
+      // Collect unique candidate chats from newest to oldest, handling supergroup migrations
+      const groupCandidates: { id: string; title: string; type: string }[] = [];
+      const privateCandidates: { id: string; title: string; type: string }[] = [];
+      const seenIds = new Set<string>();
 
       for (let i = updates.length - 1; i >= 0; i--) {
         const u = updates[i];
+        const migratedTo = u.message?.migrate_to_chat_id;
         const chat = u.message?.chat || u.channel_post?.chat || u.my_chat_member?.chat || u.chat_member?.chat;
-        if (chat && chat.id) {
-          if (!fallbackChat) {
-            fallbackChat = chat;
+
+        if (migratedTo) {
+          const migId = String(migratedTo);
+          if (!seenIds.has(migId)) {
+            seenIds.add(migId);
+            groupCandidates.push({
+              id: migId,
+              title: chat?.title || 'Supergrupo de Telegram',
+              type: 'supergroup'
+            });
           }
-          if (chat.type === 'group' || chat.type === 'supergroup' || chat.type === 'channel') {
-            groupChat = chat;
-            break;
+        }
+
+        if (chat && chat.id) {
+          const cid = String(chat.id);
+          if (!seenIds.has(cid)) {
+            seenIds.add(cid);
+            const title = chat.title || chat.username || (chat.type === 'private' ? 'Chat Privado' : 'Grupo de Telegram');
+            if (chat.type === 'group' || chat.type === 'supergroup' || chat.type === 'channel') {
+              groupCandidates.push({ id: cid, title, type: chat.type });
+            } else {
+              privateCandidates.push({ id: cid, title, type: chat.type || 'private' });
+            }
           }
         }
       }
 
-      const chosenChat = groupChat || fallbackChat;
-      if (chosenChat && chosenChat.id) {
-        const detectedId = String(chosenChat.id);
-        const title = chosenChat.title || chosenChat.username || (chosenChat.type === 'private' ? 'Chat Privado' : 'Grupo de Telegram');
-        setTargetTelegramChatId(detectedId);
-        setTargetTelegramChatTitle(title);
-        return {
-          success: true,
-          chatId: detectedId,
-          chatTitle: title,
-          message: `¡${chosenChat.type === 'supergroup' || chosenChat.type === 'group' ? 'Grupo' : 'Chat'} detectado! "${title}" (ID: ${detectedId}) asignado correctamente.`
-        };
+      // Verify candidate chats via getChat so dead/old pre-migration group IDs are skipped
+      const allCandidates = [...groupCandidates, ...privateCandidates];
+      for (const candidate of allCandidates) {
+        const check = await resolveValidTelegramChat(token, candidate.id);
+        if (check.ok) {
+          const finalId = check.chatId;
+          const finalTitle = check.title || candidate.title;
+          setBotFatherToken(token);
+          setTargetTelegramChatId(finalId);
+          setTargetTelegramChatTitle(finalTitle);
+          return {
+            success: true,
+            chatId: finalId,
+            chatTitle: finalTitle,
+            message: `¡${candidate.type === 'private' ? 'Chat' : 'Grupo'} detectado y verificado! "${finalTitle}" (ID: ${finalId}) asignado correctamente.`
+          };
+        }
       }
 
       return {
         success: false,
-        message: 'No se identificó ningún chat en las actualizaciones. Envía un mensaje como /test en el grupo de Telegram y vuelve a intentar.'
+        message: 'No se encontró ningún grupo activo donde el bot siga siendo miembro. Envía un mensaje como /test dentro de tu grupo de Telegram y vuelve a intentar.'
       };
     } catch (err: any) {
       return {
@@ -913,16 +1065,19 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const sendCharacterToTelegram = async (character: Character, level: number): Promise<{ success: boolean; message: string }> => {
-    if (!botFatherToken) {
+    const cleanToken = sanitizeTelegramToken(botFatherToken);
+    let activeChatId = sanitizeTelegramChatId(targetTelegramChatId);
+
+    if (!cleanToken) {
       return {
         success: false,
-        message: 'No hay Token de BotFather configurado. Abre la configuración de Telegram para añadir tu bot.'
+        message: 'No hay Token de BotFather configurado. Abre el Panel Admin -> Bot de BotFather para añadir tu bot.'
       };
     }
-    if (!targetTelegramChatId) {
+    if (!activeChatId) {
       return {
         success: false,
-        message: 'No hay un Chat ID o Grupo de Telegram configurado. Configura el grupo de destino primero.'
+        message: 'No hay un Chat ID o Grupo de Telegram configurado. Configura el grupo en el Panel Admin primero.'
       };
     }
 
@@ -932,58 +1087,99 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const now = new Date();
     const formattedDate = `${now.toLocaleDateString('es-ES')} - ${now.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })}`;
 
-    const caption = `<b>TARJETA OFICIAL SPYCT RPG</b>\n━━━━━━━━━━━━━━━━━━━━\n<b>Personaje:</b> ${character.name}\n<b>Nivel:</b> ${level}\n<b>Fandom:</b> ${character.fandom}\n<b>Categoría:</b> ${character.category}\n<b>Valor:</b> ${character.priceCoins} Coins\n<b>ID Único:</b> <code>${cardCode}</code>\n━━━━━━━━━━━━━━━━━━━━\n<b>Agente:</b> ${agentTag} (${agentName})\n<b>Fecha:</b> ${formattedDate}\n<i>Validado por la Red SPYCT</i>`;
+    const caption = `<b>TARJETA OFICIAL SPYCT RPG</b>\n━━━━━━━━━━━━━━━━━━━━\n<b>Personaje:</b> ${escapeTelegramHtml(character.name)}\n<b>Nivel:</b> ${level}\n<b>Fandom:</b> ${escapeTelegramHtml(character.fandom)}\n<b>Categoría:</b> ${escapeTelegramHtml(character.category)}\n<b>Valor:</b> ${character.priceCoins} Coins\n<b>ID Único:</b> <code>${escapeTelegramHtml(cardCode)}</code>\n━━━━━━━━━━━━━━━━━━━━\n<b>Agente:</b> ${escapeTelegramHtml(agentTag)} (${escapeTelegramHtml(agentName)})\n<b>Fecha:</b> ${escapeTelegramHtml(formattedDate)}\n<i>Validado por la Red SPYCT</i>`;
 
-    try {
-      // Try sendPhoto first if character has valid HTTP image
+    const attemptSend = async (chatIdToUse: string) => {
       let sentOk = false;
       let lastError = '';
+      let migratedTo: string | null = null;
 
       if (character.image && character.image.startsWith('http')) {
         try {
-          const photoRes = await fetch(`https://api.telegram.org/bot${botFatherToken}/sendPhoto`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: targetTelegramChatId,
-              photo: character.image,
-              caption: caption,
-              parse_mode: 'HTML'
-            })
+          const photoData = await telegramApiPost(cleanToken, 'sendPhoto', {
+            chat_id: chatIdToUse,
+            photo: character.image,
+            caption,
+            parse_mode: 'HTML'
           });
-          const photoData = await photoRes.json();
           if (photoData.ok) {
             sentOk = true;
+            return { ok: true, chatData: photoData.result };
           } else {
             lastError = photoData.description || 'Error al enviar foto';
+            if (photoData.parameters?.migrate_to_chat_id) {
+              migratedTo = String(photoData.parameters.migrate_to_chat_id);
+            }
           }
         } catch (e: any) {
           lastError = e?.message || 'Error en petición de foto';
         }
       }
 
-      // If photo send didn't succeed, fallback to sendMessage with photo link
+      if (migratedTo) {
+        return { ok: false, migratedTo, error: lastError };
+      }
+
       if (!sentOk) {
-        const textMessage = `${caption}\n\n<b>Foto:</b> <a href="${character.image}">Ver Imagen</a>`;
-        const textRes = await fetch(`https://api.telegram.org/bot${botFatherToken}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: targetTelegramChatId,
-            text: textMessage,
-            parse_mode: 'HTML',
-            disable_web_page_preview: false
-          })
+        const photoLinkLine =
+          character.image && character.image.startsWith('http')
+            ? `\n\n<b>Foto:</b> <a href="${escapeTelegramHtml(character.image)}">Ver Imagen</a>`
+            : '';
+        const textMessage = `${caption}${photoLinkLine}`;
+        const textData = await telegramApiPost(cleanToken, 'sendMessage', {
+          chat_id: chatIdToUse,
+          text: textMessage,
+          parse_mode: 'HTML',
+          disable_web_page_preview: 'false'
         });
-        const textData = await textRes.json();
+
         if (textData.ok) {
-          sentOk = true;
-        } else {
-          return {
-            success: false,
-            message: `Telegram rechazó el envío: ${textData.description || lastError || 'Error desconocido'}. Asegúrate de que el bot pertenezca al grupo.`
-          };
+          return { ok: true, chatData: textData.result };
         }
+        return {
+          ok: false,
+          migratedTo: textData.parameters?.migrate_to_chat_id ? String(textData.parameters.migrate_to_chat_id) : null,
+          error: textData.description || lastError || 'Error desconocido'
+        };
+      }
+
+      return { ok: true };
+    };
+
+    try {
+      let attempt = await attemptSend(activeChatId);
+
+      // If group upgraded to supergroup, save new ID and retry
+      if (!attempt.ok && attempt.migratedTo) {
+        activeChatId = attempt.migratedTo;
+        setTargetTelegramChatId(activeChatId);
+        attempt = await attemptSend(activeChatId);
+      }
+
+      // If Telegram returned "chat not found", try resolving valid chat ID (e.g. missing "-" or "-100" prefix)
+      if (!attempt.ok && attempt.error && attempt.error.toLowerCase().includes('chat not found')) {
+        const resolved = await resolveValidTelegramChat(cleanToken, activeChatId);
+        if (resolved.ok && resolved.chatId !== activeChatId) {
+          activeChatId = resolved.chatId;
+          setTargetTelegramChatId(activeChatId);
+          if (resolved.title) {
+            setTargetTelegramChatTitle(resolved.title);
+          }
+          attempt = await attemptSend(activeChatId);
+        }
+      }
+
+      if (!attempt.ok) {
+        const botIdHint = cleanToken.includes(':') ? cleanToken.split(':')[0] : 'desconocido';
+        return {
+          success: false,
+          message: `Telegram rechazó el envío (${attempt.error}). Chat ID usado: "${activeChatId}" | Bot ID: ${botIdHint}. Verifica en Panel Admin > Bot de BotFather que el Token y Chat ID guardados coincidan exactamente y pulsa "Probar".`
+        };
+      }
+
+      const returnedTitle = attempt.chatData?.chat?.title || attempt.chatData?.chat?.username;
+      if (returnedTitle) {
+        setTargetTelegramChatTitle(returnedTitle);
       }
 
       return {

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   X, 
   Search, 
@@ -25,7 +25,7 @@ import {
   ExternalLink,
   Radio
 } from 'lucide-react';
-import { useGame } from '../context/GameContext';
+import { useGame, sanitizeTelegramToken, sanitizeTelegramChatId } from '../context/GameContext';
 import { User, Character, CharacterCategory } from '../types';
 import { CHARACTER_CATEGORIES } from '../data/characters';
 
@@ -103,6 +103,14 @@ export const AdminPanelModal: React.FC = () => {
   const [tokenFeedback, setTokenFeedback] = useState<{ type: 'success' | 'info' | 'error'; message: string } | null>(null);
   const [isTestingConnection, setIsTestingConnection] = useState(false);
   const [isDetectingChatId, setIsDetectingChatId] = useState(false);
+
+  // Keep input fields synced when modal opens or context values update
+  useEffect(() => {
+    if (isAdminModalOpen) {
+      setInputToken(botFatherToken);
+      setInputChatId(targetTelegramChatId);
+    }
+  }, [isAdminModalOpen, botFatherToken, targetTelegramChatId]);
 
   if (!isAdminModalOpen) return null;
 
@@ -269,8 +277,8 @@ export const AdminPanelModal: React.FC = () => {
 
   const handleSaveBotToken = (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanToken = inputToken.trim();
-    const cleanChatId = inputChatId.trim();
+    const cleanToken = sanitizeTelegramToken(inputToken);
+    const cleanChatId = sanitizeTelegramChatId(inputChatId);
 
     if (!cleanToken && !cleanChatId) {
       setTokenFeedback({
@@ -279,18 +287,24 @@ export const AdminPanelModal: React.FC = () => {
       });
       return;
     }
+
+    setInputToken(cleanToken);
+    setInputChatId(cleanChatId);
     setBotFatherToken(cleanToken);
+    if (cleanChatId !== targetTelegramChatId) {
+      setTargetTelegramChatTitle('');
+    }
     setTargetTelegramChatId(cleanChatId);
     setTokenFeedback({
       type: 'success',
-      message: 'Token y Grupo de Telegram guardados y sincronizados con el sistema de cartas.'
+      message: `Configuración guardada (Chat ID: ${cleanChatId || 'sin definir'}). Pulsa "Probar" para verificar el envío en vivo.`
     });
-    setTimeout(() => setTokenFeedback(null), 4000);
+    setTimeout(() => setTokenFeedback(null), 5000);
   };
 
   const handleTestConnection = async () => {
-    const tokenToTest = inputToken.trim() || botFatherToken;
-    const chatToTest = inputChatId.trim() || targetTelegramChatId;
+    const tokenToTest = sanitizeTelegramToken(inputToken || botFatherToken);
+    const chatToTest = sanitizeTelegramChatId(inputChatId || targetTelegramChatId);
     if (!tokenToTest) {
       setTokenFeedback({
         type: 'error',
@@ -303,6 +317,14 @@ export const AdminPanelModal: React.FC = () => {
     setTokenFeedback(null);
     const result = await testTelegramConnection(tokenToTest, chatToTest);
     setIsTestingConnection(false);
+
+    if (result.resolvedToken) {
+      setInputToken(result.resolvedToken);
+    }
+    if (result.resolvedChatId) {
+      setInputChatId(result.resolvedChatId);
+    }
+
     setTokenFeedback({
       type: result.success ? 'success' : 'error',
       message: result.message
@@ -310,7 +332,7 @@ export const AdminPanelModal: React.FC = () => {
   };
 
   const handleAutoDetectChatId = async () => {
-    const tokenToUse = inputToken.trim() || botFatherToken;
+    const tokenToUse = sanitizeTelegramToken(inputToken || botFatherToken);
     if (!tokenToUse) {
       setTokenFeedback({
         type: 'error',
@@ -318,6 +340,7 @@ export const AdminPanelModal: React.FC = () => {
       });
       return;
     }
+    setInputToken(tokenToUse);
     setIsDetectingChatId(true);
     setTokenFeedback(null);
     const res = await detectTelegramChatId(tokenToUse);
@@ -1036,7 +1059,9 @@ export const AdminPanelModal: React.FC = () => {
                     </div>
                     {targetTelegramChatId && (
                       <span className="text-[10px] text-slate-500 font-mono block mt-0.5">
-                        {targetTelegramChatTitle ? `Grupo: ${targetTelegramChatTitle}` : `Chat ID: ${targetTelegramChatId}`}
+                        {targetTelegramChatTitle && targetTelegramChatTitle !== targetTelegramChatId
+                          ? `Grupo: ${targetTelegramChatTitle} (ID: ${targetTelegramChatId})`
+                          : `Chat ID: ${targetTelegramChatId}`}
                       </span>
                     )}
                   </div>
