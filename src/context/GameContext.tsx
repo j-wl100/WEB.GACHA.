@@ -72,7 +72,18 @@ interface GameContextType {
   setTargetTelegramChatTitle: (title: string) => void;
   testTelegramConnection: (customToken?: string, customChatId?: string) => Promise<{ success: boolean; message: string; botName?: string; resolvedToken?: string; resolvedChatId?: string; chatTitle?: string }>;
   detectTelegramChatId: (customToken?: string) => Promise<{ success: boolean; chatId?: string; chatTitle?: string; message: string }>;
-  sendCharacterToTelegram: (character: Character, level: number) => Promise<{ success: boolean; message: string }>;
+  detectCurrentUserTelegramId: () => Promise<{ success: boolean; userId?: string; message: string }>;
+  sendCharacterToTelegram: (
+    character: Character,
+    level: number
+  ) => Promise<{
+    success: boolean;
+    message: string;
+    tagApplied?: boolean;
+    tagValue?: string;
+    tagError?: string;
+    needsUserId?: boolean;
+  }>;
   
   // Helpers
   getCharacterById: (id: string) => Character | undefined;
@@ -88,6 +99,7 @@ const STORAGE_TELEGRAM_GROUP_ID_KEY = 'spyct_telegram_group_id_v1';
 const STORAGE_TELEGRAM_GROUP_TITLE_KEY = 'spyct_telegram_group_title_v1';
 const STORAGE_CHARACTERS_KEY = 'spyct_rpg_characters_v3';
 const STORAGE_DELETED_CHARS_KEY = 'spyct_rpg_deleted_ids_v3';
+const STORAGE_TG_USER_MAP_KEY = 'spyct_tg_user_ids_v1';
 const ADMIN_PASSWORD_CODE = 'J#SPYCT';
 
 // Clean initial state: no mock or test users
@@ -176,6 +188,85 @@ const telegramApiPost = async (token: string, method: string, params: Record<str
     body: new URLSearchParams(params)
   });
   return res.json();
+};
+
+// Strip emojis and format "Personaje - Fandom" within Telegram's 16-character setChatMemberTag limit
+export const buildTelegramMemberTag = (characterName: string, fandom: string): string => {
+  const stripEmojis = (str: string) =>
+    String(str || '')
+      .replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}]/gu, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const cleanName = stripEmojis(characterName) || 'Personaje';
+  const cleanFandom = stripEmojis(fandom) || 'Rol';
+
+  const fullTag = `${cleanName} - ${cleanFandom}`;
+  if (fullTag.length <= 16) return fullTag;
+
+  const firstWord = (s: string) => s.split(' ').filter(Boolean)[0] || s;
+  const shortName = firstWord(cleanName);
+  const shortFandom = firstWord(cleanFandom);
+
+  const nameWithFullFandom = `${shortName} - ${cleanFandom}`;
+  if (nameWithFullFandom.length <= 16) return nameWithFullFandom;
+
+  const bothShort = `${shortName} - ${shortFandom}`;
+  if (bothShort.length <= 16) return bothShort;
+
+  // Telegram limit is strictly 16 chars; keep "Name - Fandom" readable
+  const sep = ' - ';
+  const maxBody = 16 - sep.length; // 13 chars
+  const namePart = shortName.slice(0, Math.min(7, Math.max(3, shortName.length)));
+  const remaining = Math.max(2, maxBody - namePart.length);
+  const fandomPart = shortFandom.slice(0, remaining);
+  return `${namePart}${sep}${fandomPart}`.slice(0, 16).trim();
+};
+
+const loadCachedTgUserMap = (): Record<string, string> => {
+  try {
+    const raw = localStorage.getItem(STORAGE_TG_USER_MAP_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') return parsed;
+    }
+  } catch {
+    // ignore
+  }
+  return {};
+};
+
+const saveCachedTgUserMap = (map: Record<string, string>) => {
+  try {
+    localStorage.setItem(STORAGE_TG_USER_MAP_KEY, JSON.stringify(map));
+  } catch {
+    // ignore
+  }
+};
+
+const extractUsersFromUpdates = (updates: any[]): Record<string, string> => {
+  const map = loadCachedTgUserMap();
+  const recordUser = (u: any) => {
+    if (u && u.id && u.username && !u.is_bot) {
+      const key = String(u.username).toLowerCase().replace(/^@+/, '');
+      map[key] = String(u.id);
+    }
+  };
+
+  for (const upd of updates) {
+    recordUser(upd.message?.from);
+    recordUser(upd.edited_message?.from);
+    recordUser(upd.callback_query?.from);
+    recordUser(upd.chat_member?.from);
+    recordUser(upd.chat_member?.new_chat_member?.user);
+    recordUser(upd.my_chat_member?.from);
+    if (Array.isArray(upd.message?.new_chat_members)) {
+      upd.message.new_chat_members.forEach(recordUser);
+    }
+  }
+
+  saveCachedTgUserMap(map);
+  return map;
 };
 
 const GameContext = createContext<GameContextType | undefined>(undefined);
@@ -797,7 +888,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const connectTelegramChatId = (chatId: string) => {
     if (!currentUser) return;
-    const clean = chatId.trim();
+    const clean = sanitizeTelegramChatId(chatId);
     setUsers(prev => prev.map(u => {
       if (u.id === currentUser.id) {
         return { ...u, telegramChatId: clean };
@@ -997,6 +1088,9 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         };
       }
 
+      // Cache any @username -> user_id seen in recent updates
+      extractUsersFromUpdates(updates);
+
       // Collect unique candidate chats from newest to oldest, handling supergroup migrations
       const groupCandidates: { id: string; title: string; type: string }[] = [];
       const privateCandidates: { id: string; title: string; type: string }[] = [];
@@ -1064,7 +1158,99 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  const sendCharacterToTelegram = async (character: Character, level: number): Promise<{ success: boolean; message: string }> => {
+  const resolveTelegramUserId = async (
+    token: string,
+    telegramUsername?: string,
+    savedNumericId?: string
+  ): Promise<{ userId: string | null; webhookBlocked?: boolean }> => {
+    const cleanSaved = (savedNumericId || '').trim();
+    if (/^\d{5,}$/.test(cleanSaved)) {
+      return { userId: cleanSaved };
+    }
+
+    const cleanUser = (telegramUsername || '').toLowerCase().replace(/^@+/, '').trim();
+    if (!cleanUser) {
+      return { userId: null };
+    }
+
+    // 1. Check cached username -> user_id map
+    const cachedMap = loadCachedTgUserMap();
+    if (cachedMap[cleanUser] && /^\d{5,}$/.test(cachedMap[cleanUser])) {
+      return { userId: cachedMap[cleanUser] };
+    }
+
+    // 2. Fetch latest updates from Telegram to discover @username -> user_id
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${token}/getUpdates?limit=100`);
+      const data = await res.json();
+      if (!data.ok) {
+        if (data.description && data.description.toLowerCase().includes('webhook')) {
+          return { userId: null, webhookBlocked: true };
+        }
+        return { userId: null };
+      }
+
+      const updates = Array.isArray(data.result) ? data.result : [];
+      const updatedMap = extractUsersFromUpdates(updates);
+      if (updatedMap[cleanUser] && /^\d{5,}$/.test(updatedMap[cleanUser])) {
+        return { userId: updatedMap[cleanUser] };
+      }
+    } catch {
+      // ignore network error in lookup
+    }
+
+    return { userId: null };
+  };
+
+  const detectCurrentUserTelegramId = async (): Promise<{ success: boolean; userId?: string; message: string }> => {
+    const cleanToken = sanitizeTelegramToken(botFatherToken);
+    if (!cleanToken) {
+      return {
+        success: false,
+        message: 'El bot de Telegram aún no está configurado en el Panel Admin.'
+      };
+    }
+    if (!currentUser?.telegram) {
+      return {
+        success: false,
+        message: 'No tienes un @usuario de Telegram en tu cuenta.'
+      };
+    }
+
+    const { userId, webhookBlocked } = await resolveTelegramUserId(cleanToken, currentUser.telegram, '');
+    if (userId) {
+      connectTelegramChatId(userId);
+      return {
+        success: true,
+        userId,
+        message: `¡ID de Telegram detectado y vinculado (${userId}) para ${currentUser.telegram}!`
+      };
+    }
+
+    if (webhookBlocked) {
+      return {
+        success: false,
+        message: 'El bot tiene un webhook activo; ingresa tu ID numérico de Telegram manualmente (puedes obtenerlo con @userinfobot).'
+      };
+    }
+
+    return {
+      success: false,
+      message: `Aún no vemos a ${currentUser.telegram} en el grupo. Envía un mensaje cualquiera (ej. "hola") dentro del grupo de Telegram y vuelve a pulsar Detectar, o escribe tu ID numérico.`
+    };
+  };
+
+  const sendCharacterToTelegram = async (
+    character: Character,
+    level: number
+  ): Promise<{
+    success: boolean;
+    message: string;
+    tagApplied?: boolean;
+    tagValue?: string;
+    tagError?: string;
+    needsUserId?: boolean;
+  }> => {
     const cleanToken = sanitizeTelegramToken(botFatherToken);
     let activeChatId = sanitizeTelegramChatId(targetTelegramChatId);
 
@@ -1081,25 +1267,33 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       };
     }
 
-    const cardCode = `SPYCT-${character.id.toUpperCase()}-${level}-${currentUser?.telegram?.replace('@', '') || '0000'}`;
+    // Look up fresh character data from database/state
+    const dbCharacter = getCharacterById(character.id) || character;
     const agentTag = currentUser?.telegram || '@agente';
     const agentName = currentUser?.name || 'Operativo';
-    const now = new Date();
-    const formattedDate = `${now.toLocaleDateString('es-ES')} - ${now.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })}`;
+    const memberTag = buildTelegramMemberTag(dbCharacter.name, dbCharacter.fandom);
 
-    const caption = `<b>TARJETA OFICIAL SPYCT RPG</b>\n━━━━━━━━━━━━━━━━━━━━\n<b>Personaje:</b> ${escapeTelegramHtml(character.name)}\n<b>Nivel:</b> ${level}\n<b>Fandom:</b> ${escapeTelegramHtml(character.fandom)}\n<b>Categoría:</b> ${escapeTelegramHtml(character.category)}\n<b>Valor:</b> ${character.priceCoins} Coins\n<b>ID Único:</b> <code>${escapeTelegramHtml(cardCode)}</code>\n━━━━━━━━━━━━━━━━━━━━\n<b>Agente:</b> ${escapeTelegramHtml(agentTag)} (${escapeTelegramHtml(agentName)})\n<b>Fecha:</b> ${escapeTelegramHtml(formattedDate)}\n<i>Validado por la Red SPYCT</i>`;
+    // Resolve user's numeric Telegram user_id if available
+    const userLookup = await resolveTelegramUserId(cleanToken, currentUser?.telegram, currentUser?.telegramChatId);
+    const resolvedUserId = userLookup.userId;
+    if (resolvedUserId && currentUser && currentUser.telegramChatId !== resolvedUserId) {
+      connectTelegramChatId(resolvedUserId);
+    }
 
-    const attemptSend = async (chatIdToUse: string) => {
+    // 1. Clean card caption: photo, Personaje, Fandom, Categoría, and web user
+    const cardCaption = `<b>${escapeTelegramHtml(dbCharacter.name)}</b>\n<b>Fandom:</b> ${escapeTelegramHtml(dbCharacter.fandom)}\n<b>Categoría:</b> ${escapeTelegramHtml(dbCharacter.category)}\n<b>Usuario:</b> ${escapeTelegramHtml(agentTag)} (${escapeTelegramHtml(agentName)})`;
+
+    const attemptSendCard = async (chatIdToUse: string) => {
       let sentOk = false;
       let lastError = '';
       let migratedTo: string | null = null;
 
-      if (character.image && character.image.startsWith('http')) {
+      if (dbCharacter.image && dbCharacter.image.startsWith('http')) {
         try {
           const photoData = await telegramApiPost(cleanToken, 'sendPhoto', {
             chat_id: chatIdToUse,
-            photo: character.image,
-            caption,
+            photo: dbCharacter.image,
+            caption: cardCaption,
             parse_mode: 'HTML'
           });
           if (photoData.ok) {
@@ -1122,10 +1316,10 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (!sentOk) {
         const photoLinkLine =
-          character.image && character.image.startsWith('http')
-            ? `\n\n<b>Foto:</b> <a href="${escapeTelegramHtml(character.image)}">Ver Imagen</a>`
+          dbCharacter.image && dbCharacter.image.startsWith('http')
+            ? `\n<b>Foto:</b> <a href="${escapeTelegramHtml(dbCharacter.image)}">Ver Imagen</a>`
             : '';
-        const textMessage = `${caption}${photoLinkLine}`;
+        const textMessage = `${cardCaption}${photoLinkLine}`;
         const textData = await telegramApiPost(cleanToken, 'sendMessage', {
           chat_id: chatIdToUse,
           text: textMessage,
@@ -1147,25 +1341,70 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
 
     try {
-      let attempt = await attemptSend(activeChatId);
+      // Step 1: Verify/resolve target chat ID so setChatMemberTag & sendPhoto hit the valid supergroup
+      let chatCheck = await resolveValidTelegramChat(cleanToken, activeChatId);
+      if (chatCheck.ok) {
+        if (chatCheck.chatId !== activeChatId) {
+          activeChatId = chatCheck.chatId;
+          setTargetTelegramChatId(activeChatId);
+        }
+        if (chatCheck.title) {
+          setTargetTelegramChatTitle(chatCheck.title);
+        }
+      }
+
+      // Step 2: Assign Member Tag ("Personaje - Fandom") WITHOUT making the user an admin via setChatMemberTag
+      let tagApplied = false;
+      let tagError: string | undefined;
+      let needsUserId = false;
+
+      if (resolvedUserId) {
+        try {
+          const tagRes = await telegramApiPost(cleanToken, 'setChatMemberTag', {
+            chat_id: activeChatId,
+            user_id: resolvedUserId,
+            tag: memberTag
+          });
+          if (tagRes.ok) {
+            tagApplied = true;
+          } else {
+            const desc = String(tagRes.description || 'No se pudo asignar la etiqueta');
+            if (desc.toLowerCase().includes('right') || desc.toLowerCase().includes('permission') || desc.toLowerCase().includes('manage_tags')) {
+              tagError = 'El bot necesita el permiso de admin "Gestionar etiquetas" (can_manage_tags) activado en el grupo.';
+            } else if (desc.toLowerCase().includes('admin') || desc.toLowerCase().includes('creator') || desc.toLowerCase().includes('owner')) {
+              tagError = 'Telegram solo permite asignar etiqueta de miembro a usuarios que NO sean administradores o dueño del grupo.';
+            } else {
+              tagError = `Telegram no pudo colocar la etiqueta: ${desc}`;
+            }
+          }
+        } catch (err: any) {
+          tagError = `Error al asignar etiqueta de miembro: ${err?.message || 'Error de red'}`;
+        }
+      } else {
+        needsUserId = true;
+        tagError = `Aún falta el ID numérico de Telegram de ${agentTag} para colocar su etiqueta automáticamente.`;
+      }
+
+      // Step 3: Publish the clean card (photo + Personaje + Fandom + Categoría + Usuario)
+      let attempt = await attemptSendCard(activeChatId);
 
       // If group upgraded to supergroup, save new ID and retry
       if (!attempt.ok && attempt.migratedTo) {
         activeChatId = attempt.migratedTo;
         setTargetTelegramChatId(activeChatId);
-        attempt = await attemptSend(activeChatId);
+        attempt = await attemptSendCard(activeChatId);
       }
 
-      // If Telegram returned "chat not found", try resolving valid chat ID (e.g. missing "-" or "-100" prefix)
+      // If Telegram returned "chat not found", try resolving valid chat ID
       if (!attempt.ok && attempt.error && attempt.error.toLowerCase().includes('chat not found')) {
-        const resolved = await resolveValidTelegramChat(cleanToken, activeChatId);
-        if (resolved.ok && resolved.chatId !== activeChatId) {
-          activeChatId = resolved.chatId;
+        chatCheck = await resolveValidTelegramChat(cleanToken, activeChatId);
+        if (chatCheck.ok && chatCheck.chatId !== activeChatId) {
+          activeChatId = chatCheck.chatId;
           setTargetTelegramChatId(activeChatId);
-          if (resolved.title) {
-            setTargetTelegramChatTitle(resolved.title);
+          if (chatCheck.title) {
+            setTargetTelegramChatTitle(chatCheck.title);
           }
-          attempt = await attemptSend(activeChatId);
+          attempt = await attemptSendCard(activeChatId);
         }
       }
 
@@ -1182,9 +1421,34 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setTargetTelegramChatTitle(returnedTitle);
       }
 
+      // Step 4: Send final message telling the user they can now go to the roleplay scenario
+      const mentionHtml = resolvedUserId
+        ? `<a href="tg://user?id=${escapeTelegramHtml(resolvedUserId)}">${escapeTelegramHtml(agentTag)}</a>`
+        : escapeTelegramHtml(agentTag);
+
+      const roleplayReadyMessage =
+        `<b>¡Ya puedes ir al escenario de rol!</b>\n\n` +
+        `${mentionHtml} (<b>${escapeTelegramHtml(agentName)}</b>), ya puedes rolear con tu ficha:\n` +
+        `• <b>Personaje:</b> ${escapeTelegramHtml(dbCharacter.name)}\n` +
+        `• <b>Fandom:</b> ${escapeTelegramHtml(dbCharacter.fandom)}\n` +
+        `• <b>Categoría:</b> ${escapeTelegramHtml(dbCharacter.category)}\n` +
+        `• <b>Etiqueta asignada:</b> <code>${escapeTelegramHtml(memberTag)}</code>`;
+
+      await telegramApiPost(cleanToken, 'sendMessage', {
+        chat_id: activeChatId,
+        text: roleplayReadyMessage,
+        parse_mode: 'HTML'
+      });
+
       return {
         success: true,
-        message: `¡Tarjeta de ${character.name} enviada exitosamente al grupo de Telegram!`
+        tagApplied,
+        tagValue: memberTag,
+        tagError,
+        needsUserId,
+        message: tagApplied
+          ? `¡Listo! Se asignó la etiqueta "${memberTag}" a ${agentTag}, se publicó la tarjeta limpia de ${dbCharacter.name} y se envió el aviso para ir al escenario de rol.`
+          : `Tarjeta de ${dbCharacter.name} y aviso de rol enviados al grupo. ${tagError || ''}`
       };
     } catch (err: any) {
       return {
@@ -1241,6 +1505,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setTargetTelegramChatTitle,
         testTelegramConnection,
         detectTelegramChatId,
+        detectCurrentUserTelegramId,
         sendCharacterToTelegram,
         getCharacterById,
         getUserCharacters,

@@ -8,10 +8,12 @@ import {
   Bot,
   AlertCircle,
   CheckCircle2,
-  Loader2
+  Loader2,
+  Tag,
+  RefreshCw
 } from 'lucide-react';
 import { Character } from '../types';
-import { useGame } from '../context/GameContext';
+import { useGame, buildTelegramMemberTag } from '../context/GameContext';
 
 interface Props {
   character: Character;
@@ -30,25 +32,37 @@ export const TelegramCardModal: React.FC<Props> = ({
     botFatherToken, 
     targetTelegramChatId,
     targetTelegramChatTitle,
-    sendCharacterToTelegram
+    sendCharacterToTelegram,
+    detectCurrentUserTelegramId,
+    connectTelegramChatId
   } = useGame();
 
   const [copied, setCopied] = useState(false);
   const [isSending, setIsSending] = useState(false);
-  const [sendResult, setSendResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [isDetectingUser, setIsDetectingUser] = useState(false);
+  const [manualUserId, setManualUserId] = useState('');
+  const [userLinkFeedback, setUserLinkFeedback] = useState<string | null>(null);
+  const [sendResult, setSendResult] = useState<{
+    success: boolean;
+    message: string;
+    tagApplied?: boolean;
+    tagValue?: string;
+    tagError?: string;
+    needsUserId?: boolean;
+  } | null>(null);
 
   const cardCode = `SPYCT-${character.id.toUpperCase()}-${level}-${currentUser?.telegram?.replace('@', '') || '0000'}`;
+  const fullLabelRaw = `${character.name} - ${character.fandom}`;
+  const telegramTagValue = buildTelegramMemberTag(character.name, character.fandom);
 
-  // Clean Telegram Card format with FANDOM and CATEGORY
-  const cardTelegramText = `TARJETA OFICIAL SPYCT RPG
-----------------------------------
-Personaje: ${character.name} (Nivel ${level})
-Fandom: ${character.fandom} [${character.category}]
-Precio Base: ${character.priceCoins} Coins
-Código Único: ${cardCode}
-Propietario: ${currentUser?.telegram || '@agente'}
-----------------------------------
-Validado por SPYCT Bot Network`;
+  // Clean Telegram Card format with Name, Fandom, Category, Web User & Roleplay Ready text
+  const cardTelegramText = `${character.name}
+Fandom: ${character.fandom}
+Categoría: ${character.category}
+Usuario: ${currentUser?.telegram || '@agente'} (${currentUser?.name || 'Operativo'})
+Etiqueta: ${telegramTagValue}
+
+¡Ya puedes ir al escenario de rol!`;
 
   const handleCopy = () => {
     navigator.clipboard.writeText(cardTelegramText);
@@ -67,10 +81,31 @@ Validado por SPYCT Bot Network`;
 
     setIsSending(true);
     setSendResult(null);
+    setUserLinkFeedback(null);
 
     const result = await sendCharacterToTelegram(character, level);
     setIsSending(false);
     setSendResult(result);
+  };
+
+  const handleDetectMyTelegramId = async () => {
+    setIsDetectingUser(true);
+    setUserLinkFeedback(null);
+    const res = await detectCurrentUserTelegramId();
+    setIsDetectingUser(false);
+    setUserLinkFeedback(res.message);
+  };
+
+  const handleSaveManualUserId = (e: React.FormEvent) => {
+    e.preventDefault();
+    const clean = manualUserId.replace(/[^\d]/g, '');
+    if (!/^\d{5,}$/.test(clean)) {
+      setUserLinkFeedback('Ingresa un ID numérico válido de Telegram (ej. obtenido con @userinfobot).');
+      return;
+    }
+    connectTelegramChatId(clean);
+    setManualUserId('');
+    setUserLinkFeedback(`¡ID ${clean} vinculado! Ahora pulsa de nuevo "Usar y Enviar al Grupo" para colocar tu etiqueta.`);
   };
 
   return (
@@ -153,24 +188,86 @@ Validado por SPYCT Bot Network`;
             </div>
           </div>
 
+          {/* Member Tag Preview (Personaje - Fandom) */}
+          <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-2xl mb-3 text-xs">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider flex items-center gap-1">
+                <Tag className="w-3 h-3 text-[#1E3A8A]" />
+                Etiqueta de Miembro:
+              </span>
+              <span className="px-2 py-0.5 rounded-lg bg-[#0F172A] text-white font-mono text-[11px] font-bold truncate max-w-[180px]">
+                {telegramTagValue}
+              </span>
+            </div>
+            {fullLabelRaw.length > 16 && (
+              <p className="text-[10px] text-slate-500 mt-1 leading-snug">
+                Telegram limita las etiquetas de miembro a 16 caracteres (formato: <span className="font-semibold">{telegramTagValue}</span>).
+              </p>
+            )}
+          </div>
+
           {/* Group Delivery Status Feedback */}
           {sendResult && (
-            <div className={`p-3 rounded-2xl mb-3 text-xs leading-relaxed animate-in fade-in flex items-start gap-2 ${
+            <div className={`p-3 rounded-2xl mb-3 text-xs leading-relaxed animate-in fade-in space-y-2 ${
               sendResult.success 
                 ? 'bg-slate-100 border border-slate-300 text-[#0F172A]' 
                 : 'bg-rose-50 border border-rose-200 text-rose-800'
             }`}>
-              {sendResult.success ? (
-                <CheckCircle2 className="w-4 h-4 text-[#1E3A8A] shrink-0 mt-0.5" />
-              ) : (
-                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-              )}
-              <div className="flex-1">
-                <strong className="block font-bold mb-0.5">
-                  {sendResult.success ? 'Envío Exitoso:' : 'No se pudo enviar:'}
-                </strong>
-                <span>{sendResult.message}</span>
+              <div className="flex items-start gap-2">
+                {sendResult.success ? (
+                  <CheckCircle2 className="w-4 h-4 text-[#1E3A8A] shrink-0 mt-0.5" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                )}
+                <div className="flex-1">
+                  <strong className="block font-bold mb-0.5">
+                    {sendResult.success
+                      ? sendResult.tagApplied
+                        ? 'Etiqueta Aplicada y Ficha Enviada:'
+                        : 'Ficha Enviada (Etiqueta Pendiente):'
+                      : 'No se pudo enviar:'}
+                  </strong>
+                  <span>{sendResult.message}</span>
+                </div>
               </div>
+
+              {/* Helper when user's numeric Telegram ID hasn't been seen yet */}
+              {sendResult.success && sendResult.needsUserId && (
+                <div className="pt-2 border-t border-slate-300 space-y-2">
+                  <p className="text-[10px] text-slate-600 leading-snug">
+                    Para que el bot coloque tu etiqueta automáticamente sin hacerte admin, envía un mensaje cualquiera (ej. <code>hola</code>) en el grupo de Telegram y pulsa <strong>Detectar mi usuario</strong>, o pega tu ID numérico (obtenido en <code>@userinfobot</code>):
+                  </p>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={handleDetectMyTelegramId}
+                      disabled={isDetectingUser}
+                      className="px-2.5 py-1.5 bg-[#0F172A] hover:bg-[#1E3A8A] text-white rounded-xl text-[10px] font-bold flex items-center gap-1 shrink-0"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${isDetectingUser ? 'animate-spin' : ''}`} />
+                      <span>{isDetectingUser ? 'Buscando...' : 'Detectar mi usuario'}</span>
+                    </button>
+                  </div>
+                  <form onSubmit={handleSaveManualUserId} className="flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      placeholder="O pega tu ID numérico (ej: 987654321)"
+                      value={manualUserId}
+                      onChange={(e) => setManualUserId(e.target.value)}
+                      className="flex-1 h-8 px-2.5 text-[11px] font-mono bg-white border border-slate-300 rounded-xl text-slate-900 focus:border-[#0F172A] focus:outline-none"
+                    />
+                    <button
+                      type="submit"
+                      className="h-8 px-2.5 bg-white hover:bg-slate-200 border border-slate-300 text-[#0F172A] rounded-xl text-[10px] font-bold shrink-0"
+                    >
+                      Vincular ID
+                    </button>
+                  </form>
+                  {userLinkFeedback && (
+                    <p className="text-[10px] font-semibold text-[#1E3A8A]">{userLinkFeedback}</p>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -210,12 +307,12 @@ Validado por SPYCT Bot Network`;
             {isSending ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin text-white" />
-                <span>Enviando al Grupo de Telegram...</span>
+                <span>Asignando Etiqueta y Enviando...</span>
               </>
             ) : (
               <>
                 <Bot className="w-4 h-4 text-white" />
-                <span>Enviar Tarjeta al Grupo de Telegram</span>
+                <span>Usar y Enviar al Grupo</span>
               </>
             )}
           </button>

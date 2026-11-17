@@ -1187,13 +1187,13 @@ export const AdminPanelModal: React.FC = () => {
                 {/* Instructions snippet */}
                 <div className="p-4 bg-slate-50 border border-slate-200 rounded-2xl text-xs text-slate-600 space-y-1.5">
                   <h4 className="font-bold text-[#0F172A] uppercase tracking-wider text-[11px]">
-                    Pasos rápidos para que funcione:
+                    Pasos rápidos para que funcione (incluyendo etiquetas de rol):
                   </h4>
                   <ol className="list-decimal pl-4 space-y-1 text-[11px]">
                     <li>Crea tu bot en <strong className="text-[#0F172A]">@BotFather</strong> con <code>/newbot</code> y copia el HTTP API Token.</li>
-                    <li>Añade a tu bot al grupo de Telegram como Administrador.</li>
-                    <li>Escribe un mensaje de prueba en el grupo y pulsa <strong>&quot;Detectar Automático&quot;</strong>.</li>
-                    <li>Pulsa <strong>&quot;Guardar Configuración&quot;</strong> y <strong>&quot;Probar&quot;</strong> para verificar el envío.</li>
+                    <li>Añade el bot a tu <strong className="text-[#0F172A]">Supergrupo</strong> de Telegram como Administrador con el permiso <strong className="text-[#0F172A]">Gestionar etiquetas</strong> (<code>can_manage_tags</code>) activado.</li>
+                    <li>Escribe un mensaje de prueba en el grupo y pulsa <strong>&quot;Detectar Automático&quot;</strong> (o ingresa el ID manualmente y pulsa <strong>&quot;Probar&quot;</strong>).</li>
+                    <li>Para que el bot asigne la etiqueta <code>Personaje - Fandom</code> a un miembro sin hacerlo admin, el usuario debe haber escrito al menos un mensaje en el grupo o vincular su ID numérico.</li>
                   </ol>
                 </div>
               </div>
